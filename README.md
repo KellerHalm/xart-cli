@@ -2,16 +2,6 @@
 
 CLI повторяет основные возможности сайта [xart-rose.vercel.app](https://xart-rose.vercel.app) через API [https://openanix.ru/anixart-api-docs/](https://openanix.ru/anixart-api-docs/).
 
-## Быстрые ссылки
-
-- [Документация (`docs/`)](docs/)
-- [Оглавление документации](docs/README.md)
-- [Установка](docs/installation.md)
-- [Конфигурация и авторизация](docs/configuration.md)
-- [UI режим](docs/ui.md)
-- [Команда `watch`](docs/watch.md)
-- [Справочник команд](docs/cli-reference.md)
-
 ## Возможности
 
 - авторизация и работа с токеном;
