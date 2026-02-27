@@ -89,6 +89,12 @@ type bookmarkSetMsg struct {
 	Message string
 }
 
+type voiceoversLoadedMsg struct {
+	ReleaseID  int
+	Voiceovers []player.Voiceover
+	Err        error
+}
+
 type watchResolvedMsg struct {
 	Selection player.Selection
 	Player    string
@@ -135,6 +141,11 @@ type Model struct {
 	mode      viewMode
 	detail    *Detail
 	detailPos int
+
+	watchReleaseID          int
+	voiceoverPickerOpen     bool
+	voiceoverPickerItems    []player.Voiceover
+	voiceoverPickerSelected int
 }
 
 func NewModel(client *xart.Client, token string, userID int, categoryKey string, page int, callbacks AuthCallbacks) *Model {
@@ -297,9 +308,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.statusText = msg.Message
 		return m, nil
+	case voiceoversLoadedMsg:
+		if msg.ReleaseID != m.watchReleaseID {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.errText = msg.Err.Error()
+			m.watchReleaseID = 0
+			return m, nil
+		}
+		if len(msg.Voiceovers) == 0 {
+			m.errText = "не удалось получить список озвучек"
+			m.watchReleaseID = 0
+			return m, nil
+		}
+		if len(msg.Voiceovers) == 1 {
+			m.voiceoverPickerOpen = false
+			m.voiceoverPickerItems = nil
+			m.voiceoverPickerSelected = 0
+			return m, m.watchByReleaseCmd(msg.ReleaseID, msg.Voiceovers[0].ID)
+		}
+		m.errText = ""
+		m.voiceoverPickerOpen = true
+		m.voiceoverPickerItems = msg.Voiceovers
+		m.voiceoverPickerSelected = 0
+		m.statusText = fmt.Sprintf("Выберите озвучку: %d вариантов", len(msg.Voiceovers))
+		return m, nil
 	case watchResolvedMsg:
 		if msg.Err != nil {
 			m.errText = msg.Err.Error()
+			m.watchReleaseID = 0
 			return m, nil
 		}
 		launch, err := player.BuildLaunchPlan(msg.Selection.Episode.URL, player.LaunchOptions{
@@ -334,8 +372,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case watchFinishedMsg:
 		if msg.Err != nil {
 			m.errText = "Ошибка плеера: " + msg.Err.Error()
+			m.watchReleaseID = 0
 			return m, nil
 		}
+		m.watchReleaseID = 0
 		m.errText = ""
 		m.statusText = fmt.Sprintf(
 			"Просмотр завершен: %s (%s)",
@@ -404,6 +444,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.auth != nil {
 		return m.handleAuthKey(msg)
 	}
+	if m.voiceoverPickerOpen {
+		return m.handleVoiceoverPickerKey(msg)
+	}
 
 	switch msg.String() {
 	case "ctrl+c", "q":
@@ -438,7 +481,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "f":
 			return m, m.toggleFavoriteCmd()
 		case "w":
-			return m, m.watchSelectedCmd()
+			return m, m.beginVoiceoverSelectionCmd()
 		case "m":
 			m.cyclePlayerPreference()
 			return m, nil
@@ -536,7 +579,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "f":
 		return m, m.toggleFavoriteCmd()
 	case "w":
-		return m, m.watchSelectedCmd()
+		return m, m.beginVoiceoverSelectionCmd()
 	case "m":
 		m.cyclePlayerPreference()
 		return m, nil
@@ -570,25 +613,37 @@ func (m *Model) View() string {
 	}
 
 	header := m.renderHeader()
+	voiceoverPicker := m.renderVoiceoverPicker()
 	authForm := m.renderAuthForm()
 	footer := m.renderFooter()
 	headerLines := countLines(header)
+	voiceoverLines := countLines(voiceoverPicker)
 	authLines := countLines(authForm)
 	footerLines := countLines(footer)
-	bodyLines := m.bodyLines(headerLines, authLines, footerLines)
+	bodyLines := m.bodyLines(headerLines, voiceoverLines+authLines, footerLines)
 	if m.mode == modeDetail {
 		body := m.renderDetail(bodyLines)
-		if authForm != "" {
-			return lipgloss.JoinVertical(lipgloss.Left, header, body, authForm, footer)
+		parts := []string{header, body}
+		if voiceoverPicker != "" {
+			parts = append(parts, voiceoverPicker)
 		}
-		return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+		if authForm != "" {
+			parts = append(parts, authForm)
+		}
+		parts = append(parts, footer)
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
 	}
 
 	body := m.renderGrid(bodyLines)
-	if authForm != "" {
-		return lipgloss.JoinVertical(lipgloss.Left, header, body, authForm, footer)
+	parts := []string{header, body}
+	if voiceoverPicker != "" {
+		parts = append(parts, voiceoverPicker)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	if authForm != "" {
+		parts = append(parts, authForm)
+	}
+	parts = append(parts, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 func (m *Model) renderHeader() string {
@@ -776,25 +831,67 @@ func (m *Model) renderDetail(bodyLines int) string {
 		Render(box.Render(strings.Join(visible, "\n")))
 }
 
+func (m *Model) renderVoiceoverPicker() string {
+	if !m.voiceoverPickerOpen || len(m.voiceoverPickerItems) == 0 {
+		return ""
+	}
+
+	panelWidth := max(24, m.width-6)
+	if panelWidth > 96 {
+		panelWidth = 96
+	}
+	innerWidth := max(10, panelWidth-4)
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+	normalStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+
+	lines := []string{
+		titleStyle.Render("Выбор озвучки перед запуском"),
+		normalStyle.Render("↑/↓ или j/k — выбрать, Enter — запустить, Esc — отмена"),
+		"",
+	}
+
+	for i, voiceover := range m.voiceoverPickerItems {
+		prefix := fmt.Sprintf(" %d. ", i+1)
+		item := fmt.Sprintf("%s%s (id=%d)", prefix, emptyFallback(voiceover.Name, "без названия"), voiceover.ID)
+		if i == m.voiceoverPickerSelected {
+			item = "▶ " + strings.TrimLeft(item, " ")
+			lines = append(lines, selectedStyle.Render(trimRunes(item, innerWidth)))
+			continue
+		}
+		lines = append(lines, normalStyle.Render(trimRunes(item, innerWidth)))
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(0, 1).
+		Width(panelWidth)
+
+	return lipgloss.NewStyle().
+		Padding(0, 1).
+		MaxWidth(max(1, m.width)).
+		Render(box.Render(strings.Join(lines, "\n")))
+}
+
 func (m *Model) renderFooter() string {
-	help := "Grid: ←→↑↓/h j k l, Enter=детали, w=смотреть, m=плеер, f=избранное, 0..5=список, b=закладки, g=главная, i=вход, u=регистрация, o=выход, Tab/[ ]=категория, n/p=страница, r=reload, q=выход"
-	if m.auth != nil {
-		help = "Auth: ввод текста, Tab/Shift+Tab = поле, Enter = отправить, Esc = закрыть"
+	help := "Grid: ????/h j k l, Enter=??????, w=????????, m=?????, f=?????????, 0..5=??????, b=????????, g=???????, i=????, u=???????????, o=?????, Tab/[ ]=?????????, n/p=????????, r=reload, q=?????"
+	if m.voiceoverPickerOpen {
+		help = "Voiceover: ?/? ??? j/k ???????, Enter ?????????, 1..9 ??????? ?????, Esc ??????"
+	} else if m.auth != nil {
+		help = "Auth: ???? ??????, Tab/Shift+Tab = ????, Enter = ?????????, Esc = ???????"
+	} else if m.mode == modeDetail {
+		help = "Detail: esc=?????, j/k ??? ?/?=??????, w=????????, m=?????, f=?????????, 0..5=??????, b=????????, g=???????, i=????, u=???????????, o=?????, q=?????"
 	}
-	if m.mode == modeDetail {
-		help = "Detail: esc=назад, j/k или ↑/↓=скролл, w=смотреть, m=плеер, f=избранное, 0..5=список, b=закладки, g=главная, i=вход, u=регистрация, o=выход, q=выход"
-		if m.auth != nil {
-			help = "Auth: ввод текста, Tab/Shift+Tab = поле, Enter = отправить, Esc = закрыть"
-		}
-	}
-	if m.width < 100 && m.auth == nil {
+	if m.width < 100 && m.auth == nil && !m.voiceoverPickerOpen {
 		if m.mode == modeDetail {
-			help = "Detail: esc назад | j/k скролл | w | m | f | 0..5 | b/g | i/u/o | q"
+			help = "Detail: esc ????? | j/k ?????? | w | m | f | 0..5 | b/g | i/u/o | q"
 		} else {
-			help = "Grid: move ←→↑↓/hjkl | Enter | w | m | Tab | n/p | f | 0..5 | b/g | i/u/o | q"
+			help = "Grid: move ????/hjkl | Enter | w | m | Tab | n/p | f | 0..5 | b/g | i/u/o | q"
 		}
 	}
-	if m.width < 72 && m.auth == nil {
+	if m.width < 72 && m.auth == nil && !m.voiceoverPickerOpen {
 		if m.mode == modeDetail {
 			help = "Detail: esc | j/k | w | m | f | 0..5 | b/g | q"
 		} else {
@@ -953,7 +1050,7 @@ func (m *Model) setBookmarkCmd(list int) tea.Cmd {
 	}
 }
 
-func (m *Model) watchSelectedCmd() tea.Cmd {
+func (m *Model) beginVoiceoverSelectionCmd() tea.Cmd {
 	releaseID := 0
 	if m.mode == modeDetail && m.detail != nil && m.detail.ID > 0 {
 		releaseID = m.detail.ID
@@ -961,20 +1058,50 @@ func (m *Model) watchSelectedCmd() tea.Cmd {
 		releaseID = m.selectedCard().ID
 	}
 	if releaseID <= 0 {
-		m.statusText = "Сначала выберите тайтл для просмотра"
+		m.statusText = "??????? ???????? ????? ??? ?????????"
 		return nil
 	}
 
+	m.watchReleaseID = releaseID
+	m.voiceoverPickerOpen = false
+	m.voiceoverPickerItems = nil
+	m.voiceoverPickerSelected = 0
+	m.errText = ""
+	m.statusText = "???????? ?????? ???????..."
+	return m.fetchVoiceoversCmd(releaseID)
+}
+
+func (m *Model) fetchVoiceoversCmd(releaseID int) tea.Cmd {
+	return func() tea.Msg {
+		voiceovers, err := player.ListVoiceovers(
+			context.Background(),
+			m.client,
+			releaseID,
+		)
+		if err != nil {
+			return voiceoversLoadedMsg{
+				ReleaseID: releaseID,
+				Err:       err,
+			}
+		}
+		return voiceoversLoadedMsg{
+			ReleaseID:  releaseID,
+			Voiceovers: voiceovers,
+		}
+	}
+}
+
+func (m *Model) watchByReleaseCmd(releaseID int, voiceoverID int) tea.Cmd {
 	selectedPlayer := m.preferredPlayer
 	m.errText = ""
-	m.statusText = "Ищу доступный эпизод и запускаю плеер..."
+	m.statusText = "??? ????????? ?????? ? ???????? ?????..."
 	return func() tea.Msg {
 		selection, err := player.ResolveSelection(
 			context.Background(),
 			m.client,
 			releaseID,
 			m.token,
-			0,
+			voiceoverID,
 			0,
 			-1,
 		)
@@ -988,7 +1115,55 @@ func (m *Model) watchSelectedCmd() tea.Cmd {
 	}
 }
 
+func (m *Model) handleVoiceoverPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if len(m.voiceoverPickerItems) == 0 {
+		m.voiceoverPickerOpen = false
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "esc", "backspace", "q":
+		m.voiceoverPickerOpen = false
+		m.voiceoverPickerItems = nil
+		m.voiceoverPickerSelected = 0
+		m.watchReleaseID = 0
+		m.statusText = "????? ??????? ???????"
+		return m, nil
+	case "up", "k":
+		if m.voiceoverPickerSelected > 0 {
+			m.voiceoverPickerSelected--
+		}
+		return m, nil
+	case "down", "j":
+		if m.voiceoverPickerSelected < len(m.voiceoverPickerItems)-1 {
+			m.voiceoverPickerSelected++
+		}
+		return m, nil
+	case "enter":
+		voiceover := m.voiceoverPickerItems[m.voiceoverPickerSelected]
+		m.voiceoverPickerOpen = false
+		m.voiceoverPickerItems = nil
+		m.voiceoverPickerSelected = 0
+		return m, m.watchByReleaseCmd(m.watchReleaseID, voiceover.ID)
+	}
+
+	if len(msg.Runes) == 1 && msg.Runes[0] >= '1' && msg.Runes[0] <= '9' {
+		index := int(msg.Runes[0] - '1')
+		if index < len(m.voiceoverPickerItems) {
+			m.voiceoverPickerSelected = index
+			voiceover := m.voiceoverPickerItems[m.voiceoverPickerSelected]
+			m.voiceoverPickerOpen = false
+			m.voiceoverPickerItems = nil
+			m.voiceoverPickerSelected = 0
+			return m, m.watchByReleaseCmd(m.watchReleaseID, voiceover.ID)
+		}
+	}
+
+	return m, nil
+}
+
 func (m *Model) playerPreferenceLabel() string {
+
 	if m.preferredPlayer == "" {
 		return "auto"
 	}
@@ -1074,6 +1249,10 @@ func (m *Model) switchSection(section sectionMode) tea.Cmd {
 	m.mode = modeGrid
 	m.detail = nil
 	m.detailPos = 0
+	m.watchReleaseID = 0
+	m.voiceoverPickerOpen = false
+	m.voiceoverPickerItems = nil
+	m.voiceoverPickerSelected = 0
 	m.beginCardsReload(true)
 	if section == sectionBookmarks && m.userID == 0 {
 		m.statusText = "Раздел: Закладки (без ID профиля доступно только «Избранные»)"

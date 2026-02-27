@@ -9,9 +9,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +83,13 @@ type LaunchPlan struct {
 	URL        string
 }
 
+func ListVoiceovers(ctx context.Context, client *xart.Client, releaseID int) ([]Voiceover, error) {
+	if releaseID <= 0 {
+		return nil, fmt.Errorf("release id must be > 0")
+	}
+	return fetchVoiceovers(ctx, client, releaseID)
+}
+
 func ResolveSelection(ctx context.Context, client *xart.Client, releaseID int, token string, voiceoverID, sourceID, episodePosition int) (Selection, error) {
 	if releaseID <= 0 {
 		return Selection{}, fmt.Errorf("release id must be > 0")
@@ -137,7 +146,7 @@ func BuildLaunchPlan(streamURL string, opts LaunchOptions) (LaunchPlan, error) {
 
 	if executable == "" {
 		for _, candidate := range knownPlayers {
-			resolved, err := exec.LookPath(candidate)
+			resolved, err := resolvePlayerExecutable(candidate)
 			if err != nil {
 				continue
 			}
@@ -154,9 +163,9 @@ func BuildLaunchPlan(streamURL string, opts LaunchOptions) (LaunchPlan, error) {
 		if len(parts) > 1 {
 			extraArgs = append(parts[1:], extraArgs...)
 		}
-		resolved, err := exec.LookPath(executable)
+		resolved, err := resolvePlayerExecutable(executable)
 		if err != nil {
-			return LaunchPlan{}, fmt.Errorf("player %q not found in PATH", executable)
+			return LaunchPlan{}, fmt.Errorf("player %q not found", executable)
 		}
 		executable = resolved
 	}
@@ -189,11 +198,65 @@ func BuildLaunchPlan(streamURL string, opts LaunchOptions) (LaunchPlan, error) {
 func DetectAvailablePlayers() []string {
 	available := make([]string, 0, len(knownPlayers))
 	for _, candidate := range knownPlayers {
-		if _, err := exec.LookPath(candidate); err == nil {
+		if _, err := resolvePlayerExecutable(candidate); err == nil {
 			available = append(available, candidate)
 		}
 	}
 	return available
+}
+
+func resolvePlayerExecutable(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("empty executable name")
+	}
+
+	if strings.ContainsAny(name, `/\`) {
+		if _, err := os.Stat(name); err == nil {
+			return name, nil
+		}
+	}
+
+	if resolved, err := exec.LookPath(name); err == nil {
+		return resolved, nil
+	}
+	if runtime.GOOS == "windows" {
+		if resolved, err := exec.LookPath(name + ".exe"); err == nil {
+			return resolved, nil
+		}
+
+		for _, p := range windowsPlayerCandidates(strings.ToLower(strings.TrimSuffix(filepath.Base(name), filepath.Ext(name)))) {
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("executable %q not found", name)
+}
+
+func windowsPlayerCandidates(playerName string) []string {
+	switch playerName {
+	case "vlc":
+		return []string{
+			`C:\Program Files\VideoLAN\VLC\vlc.exe`,
+			`C:\Program Files (x86)\VideoLAN\VLC\vlc.exe`,
+		}
+	case "mpv":
+		return []string{
+			`C:\Program Files\mpv\mpv.exe`,
+			`C:\Program Files (x86)\mpv\mpv.exe`,
+			`C:\mpv\mpv.exe`,
+		}
+	case "ffplay":
+		return []string{
+			`C:\ProgramData\chocolatey\bin\ffplay.exe`,
+			`C:\Program Files\ffmpeg\bin\ffplay.exe`,
+			`C:\Program Files (x86)\ffmpeg\bin\ffplay.exe`,
+		}
+	default:
+		return nil
+	}
 }
 
 func (p LaunchPlan) Command() *exec.Cmd {

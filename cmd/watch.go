@@ -22,6 +22,7 @@ func newWatchCommand() *cobra.Command {
 	var playerExecutable string
 	var playerArgs []string
 	var choosePlayer bool
+	var chooseVoiceover bool
 	var printURL bool
 	var noProgress bool
 
@@ -35,13 +36,25 @@ func newWatchCommand() *cobra.Command {
 			if choosePlayer && strings.TrimSpace(playerExecutable) != "" {
 				return fmt.Errorf("flags --choose-player and --player are mutually exclusive")
 			}
+			if chooseVoiceover && voiceoverID > 0 {
+				return fmt.Errorf("flags --choose-voiceover and --voiceover-id are mutually exclusive")
+			}
+
+			selectedVoiceoverID := voiceoverID
+			if chooseVoiceover {
+				var err error
+				selectedVoiceoverID, err = chooseVoiceoverInteractively(releaseID)
+				if err != nil {
+					return err
+				}
+			}
 
 			selection, err := player.ResolveSelection(
 				withContext(),
 				rt.client,
 				releaseID,
 				tokenOptional(),
-				voiceoverID,
+				selectedVoiceoverID,
 				sourceID,
 				episodePosition,
 			)
@@ -110,6 +123,7 @@ func newWatchCommand() *cobra.Command {
 	cmd.Flags().IntVar(&episodePosition, "episode", -1, "Позиция эпизода (по умолчанию последний доступный)")
 	cmd.Flags().StringVar(&playerExecutable, "player", "", "Плеер: mpv|vlc|ffplay или путь к исполняемому файлу")
 	cmd.Flags().BoolVar(&choosePlayer, "choose-player", false, "Выбрать плеер интерактивно перед запуском")
+	cmd.Flags().BoolVar(&chooseVoiceover, "choose-voiceover", false, "Выбрать озвучку интерактивно перед запуском")
 	cmd.Flags().StringArrayVar(&playerArgs, "player-arg", nil, "Дополнительный аргумент плеера (можно повторять)")
 	cmd.Flags().BoolVar(&printURL, "print-url", false, "Только вывести URL выбранного эпизода")
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Не отмечать эпизод в истории/просмотренном")
@@ -128,17 +142,57 @@ func choosePlayerInteractively() (string, error) {
 		fmt.Printf("  %d) %s\n", i+1, name)
 	}
 
+	choice, err := readInteractiveChoice(len(available))
+	if err != nil {
+		return "", err
+	}
+	if choice == 0 {
+		return "", nil
+	}
+	return available[choice-1], nil
+}
+
+func chooseVoiceoverInteractively(releaseID int) (int, error) {
+	voiceovers, err := player.ListVoiceovers(withContext(), rt.client, releaseID)
+	if err != nil {
+		return 0, err
+	}
+	if len(voiceovers) == 0 {
+		return 0, fmt.Errorf("voiceovers not found")
+	}
+
+	fmt.Println("Choose voiceover:")
+	fmt.Println("  0) auto (first available)")
+	for i, voiceover := range voiceovers {
+		fmt.Printf("  %d) %s (id=%d)\n", i+1, voiceover.Name, voiceover.ID)
+	}
+
+	choice, err := readInteractiveChoice(len(voiceovers))
+	if err != nil {
+		return 0, err
+	}
+	if choice == 0 {
+		return 0, nil
+	}
+	return voiceovers[choice-1].ID, nil
+}
+
+func readInteractiveChoice(max int) (int, error) {
+	if max <= 0 {
+		return 0, fmt.Errorf("choice list is empty")
+	}
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("Enter number: ")
+		fmt.Printf("Enter number (0..%d): ", max)
 		line, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
-			return "", fmt.Errorf("read choice: %w", err)
+			return 0, fmt.Errorf("read choice: %w", err)
 		}
+
 		line = strings.TrimSpace(line)
 		if line == "" {
 			if errors.Is(err, io.EOF) {
-				return "", fmt.Errorf("empty player choice")
+				return 0, fmt.Errorf("empty choice")
 			}
 			continue
 		}
@@ -147,20 +201,17 @@ func choosePlayerInteractively() (string, error) {
 		if convErr != nil {
 			fmt.Printf("Invalid choice %q\n", line)
 			if errors.Is(err, io.EOF) {
-				return "", fmt.Errorf("invalid player choice %q", line)
+				return 0, fmt.Errorf("invalid choice %q", line)
 			}
 			continue
 		}
-		if choice == 0 {
-			return "", nil
-		}
-		if choice > 0 && choice <= len(available) {
-			return available[choice-1], nil
+		if choice >= 0 && choice <= max {
+			return choice, nil
 		}
 
-		fmt.Printf("Choose number in range 0..%d\n", len(available))
+		fmt.Printf("Choose number in range 0..%d\n", max)
 		if errors.Is(err, io.EOF) {
-			return "", fmt.Errorf("invalid player choice %q", line)
+			return 0, fmt.Errorf("invalid choice %q", line)
 		}
 	}
 }
