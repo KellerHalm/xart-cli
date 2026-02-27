@@ -1,6 +1,6 @@
 ﻿# Xart-CLI - консольный клиент Anixart/Xart на Go
 
-CLI повторяет основные возможности сайта `xart-rose.vercel.app` через API `https://api-s.anixsekai.com`.
+CLI повторяет основные возможности сайта [xart-rose.vercel.app](https://xart-rose.vercel.app) через API [https://openanix.ru/anixart-api-docs/](https://openanix.ru/anixart-api-docs/).
 
 ## Быстрые ссылки
 
@@ -115,7 +115,7 @@ go run . watch --id 17443
 
 Поля:
 
-- `api_base_url` (по умолчанию `https://api-s.anixsekai.com`);
+- `api_base_url` (по умолчанию `https://openanix.ru/anixart-api-docs/`);
 - `user_agent`;
 - `token`;
 - `user_id`.
