@@ -91,6 +91,7 @@ type bookmarkSetMsg struct {
 
 type watchResolvedMsg struct {
 	Selection player.Selection
+	Player    string
 	Err       error
 }
 
@@ -104,6 +105,9 @@ type Model struct {
 	client *xart.Client
 	token  string
 	userID int
+
+	availablePlayers []string
+	preferredPlayer  string
 
 	authCallbacks AuthCallbacks
 	auth          *authForm
@@ -175,6 +179,7 @@ func NewModel(client *xart.Client, token string, userID int, categoryKey string,
 		client:             client,
 		token:              token,
 		userID:             userID,
+		availablePlayers:   player.DetectAvailablePlayers(),
 		authCallbacks:      callbacks,
 		section:            section,
 		homeCategories:     homeCategories,
@@ -297,7 +302,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errText = msg.Err.Error()
 			return m, nil
 		}
-		launch, err := player.BuildLaunchPlan(msg.Selection.Episode.URL, player.LaunchOptions{})
+		launch, err := player.BuildLaunchPlan(msg.Selection.Episode.URL, player.LaunchOptions{
+			Player: msg.Player,
+		})
 		if err != nil {
 			m.errText = err.Error()
 			return m, nil
@@ -432,6 +439,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.toggleFavoriteCmd()
 		case "w":
 			return m, m.watchSelectedCmd()
+		case "m":
+			m.cyclePlayerPreference()
+			return m, nil
 		case "0", "1", "2", "3", "4", "5":
 			list := int(msg.Runes[0] - '0')
 			return m, m.setBookmarkCmd(list)
@@ -527,6 +537,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.toggleFavoriteCmd()
 	case "w":
 		return m, m.watchSelectedCmd()
+	case "m":
+		m.cyclePlayerPreference()
+		return m, nil
 	case "0", "1", "2", "3", "4", "5":
 		list := int(msg.Runes[0] - '0')
 		return m, m.setBookmarkCmd(list)
@@ -591,7 +604,7 @@ func (m *Model) renderHeader() string {
 	textWidth := m.contentWidth()
 
 	header := titleStyle.Render(trimRunes("Xart Terminal UI", textWidth))
-	meta := metaStyle.Render(wrapForWidth(fmt.Sprintf("Раздел: %s  |  Категория: %s  |  Страница: %d  |  Режим: %s", m.sectionName(), m.currentCategory().Title, m.page, authState), textWidth))
+	meta := metaStyle.Render(wrapForWidth(fmt.Sprintf("Раздел: %s  |  Категория: %s  |  Страница: %d  |  Режим: %s  |  Плеер: %s", m.sectionName(), m.currentCategory().Title, m.page, authState, m.playerPreferenceLabel()), textWidth))
 
 	lines := []string{header, meta}
 	if m.loading {
@@ -764,28 +777,28 @@ func (m *Model) renderDetail(bodyLines int) string {
 }
 
 func (m *Model) renderFooter() string {
-	help := "Grid: ←→↑↓/h j k l, Enter=детали, w=смотреть, f=избранное, 0..5=список, b=закладки, g=главная, i=вход, u=регистрация, o=выход, Tab/[ ]=категория, n/p=страница, r=reload, q=выход"
+	help := "Grid: ←→↑↓/h j k l, Enter=детали, w=смотреть, m=плеер, f=избранное, 0..5=список, b=закладки, g=главная, i=вход, u=регистрация, o=выход, Tab/[ ]=категория, n/p=страница, r=reload, q=выход"
 	if m.auth != nil {
 		help = "Auth: ввод текста, Tab/Shift+Tab = поле, Enter = отправить, Esc = закрыть"
 	}
 	if m.mode == modeDetail {
-		help = "Detail: esc=назад, j/k или ↑/↓=скролл, w=смотреть, f=избранное, 0..5=список, b=закладки, g=главная, i=вход, u=регистрация, o=выход, q=выход"
+		help = "Detail: esc=назад, j/k или ↑/↓=скролл, w=смотреть, m=плеер, f=избранное, 0..5=список, b=закладки, g=главная, i=вход, u=регистрация, o=выход, q=выход"
 		if m.auth != nil {
 			help = "Auth: ввод текста, Tab/Shift+Tab = поле, Enter = отправить, Esc = закрыть"
 		}
 	}
 	if m.width < 100 && m.auth == nil {
 		if m.mode == modeDetail {
-			help = "Detail: esc назад | j/k скролл | w | f | 0..5 | b/g | i/u/o | q"
+			help = "Detail: esc назад | j/k скролл | w | m | f | 0..5 | b/g | i/u/o | q"
 		} else {
-			help = "Grid: move ←→↑↓/hjkl | Enter | w | Tab | n/p | f | 0..5 | b/g | i/u/o | q"
+			help = "Grid: move ←→↑↓/hjkl | Enter | w | m | Tab | n/p | f | 0..5 | b/g | i/u/o | q"
 		}
 	}
 	if m.width < 72 && m.auth == nil {
 		if m.mode == modeDetail {
-			help = "Detail: esc | j/k | w | f | 0..5 | b/g | q"
+			help = "Detail: esc | j/k | w | m | f | 0..5 | b/g | q"
 		} else {
-			help = "Grid: arrows/hjkl | Enter | w | Tab | n/p | b/g | q"
+			help = "Grid: arrows/hjkl | Enter | w | m | Tab | n/p | b/g | q"
 		}
 	}
 
@@ -952,6 +965,7 @@ func (m *Model) watchSelectedCmd() tea.Cmd {
 		return nil
 	}
 
+	selectedPlayer := m.preferredPlayer
 	m.errText = ""
 	m.statusText = "Ищу доступный эпизод и запускаю плеер..."
 	return func() tea.Msg {
@@ -967,8 +981,36 @@ func (m *Model) watchSelectedCmd() tea.Cmd {
 		if err != nil {
 			return watchResolvedMsg{Err: err}
 		}
-		return watchResolvedMsg{Selection: selection}
+		return watchResolvedMsg{
+			Selection: selection,
+			Player:    selectedPlayer,
+		}
 	}
+}
+
+func (m *Model) playerPreferenceLabel() string {
+	if m.preferredPlayer == "" {
+		return "auto"
+	}
+	return m.preferredPlayer
+}
+
+func (m *Model) cyclePlayerPreference() {
+	options := make([]string, 0, len(m.availablePlayers)+1)
+	options = append(options, "")
+	options = append(options, m.availablePlayers...)
+
+	current := 0
+	for i, name := range options {
+		if name == m.preferredPlayer {
+			current = i
+			break
+		}
+	}
+
+	next := (current + 1) % len(options)
+	m.preferredPlayer = options[next]
+	m.statusText = fmt.Sprintf("Плеер: %s", m.playerPreferenceLabel())
 }
 
 func (m *Model) currentCategory() category {

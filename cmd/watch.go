@@ -1,8 +1,13 @@
 package cmd
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -16,6 +21,7 @@ func newWatchCommand() *cobra.Command {
 	var episodePosition int
 	var playerExecutable string
 	var playerArgs []string
+	var choosePlayer bool
 	var printURL bool
 	var noProgress bool
 
@@ -25,6 +31,9 @@ func newWatchCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if releaseID <= 0 {
 				return fmt.Errorf("flag --id is required")
+			}
+			if choosePlayer && strings.TrimSpace(playerExecutable) != "" {
+				return fmt.Errorf("flags --choose-player and --player are mutually exclusive")
 			}
 
 			selection, err := player.ResolveSelection(
@@ -45,6 +54,14 @@ func newWatchCommand() *cobra.Command {
 				return nil
 			}
 
+			selectedPlayer := playerExecutable
+			if choosePlayer {
+				selectedPlayer, err = choosePlayerInteractively()
+				if err != nil {
+					return err
+				}
+			}
+
 			if !noProgress {
 				if err := player.MarkEpisodeProgress(
 					withContext(),
@@ -60,7 +77,7 @@ func newWatchCommand() *cobra.Command {
 			}
 
 			launch, err := player.BuildLaunchPlan(selection.Episode.URL, player.LaunchOptions{
-				Player:    playerExecutable,
+				Player:    selectedPlayer,
 				ExtraArgs: playerArgs,
 			})
 			if err != nil {
@@ -92,8 +109,58 @@ func newWatchCommand() *cobra.Command {
 	cmd.Flags().IntVar(&sourceID, "source-id", 0, "ID источника/плеера (по умолчанию первый доступный)")
 	cmd.Flags().IntVar(&episodePosition, "episode", -1, "Позиция эпизода (по умолчанию последний доступный)")
 	cmd.Flags().StringVar(&playerExecutable, "player", "", "Плеер: mpv|vlc|ffplay или путь к исполняемому файлу")
+	cmd.Flags().BoolVar(&choosePlayer, "choose-player", false, "Выбрать плеер интерактивно перед запуском")
 	cmd.Flags().StringArrayVar(&playerArgs, "player-arg", nil, "Дополнительный аргумент плеера (можно повторять)")
 	cmd.Flags().BoolVar(&printURL, "print-url", false, "Только вывести URL выбранного эпизода")
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Не отмечать эпизод в истории/просмотренном")
 	return cmd
+}
+
+func choosePlayerInteractively() (string, error) {
+	available := player.DetectAvailablePlayers()
+	if len(available) == 0 {
+		return "", fmt.Errorf("player not found; install one of: mpv, vlc, ffplay")
+	}
+
+	fmt.Println("Choose player:")
+	fmt.Println("  0) auto")
+	for i, name := range available {
+		fmt.Printf("  %d) %s\n", i+1, name)
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("Enter number: ")
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("read choice: %w", err)
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			if errors.Is(err, io.EOF) {
+				return "", fmt.Errorf("empty player choice")
+			}
+			continue
+		}
+
+		choice, convErr := strconv.Atoi(line)
+		if convErr != nil {
+			fmt.Printf("Invalid choice %q\n", line)
+			if errors.Is(err, io.EOF) {
+				return "", fmt.Errorf("invalid player choice %q", line)
+			}
+			continue
+		}
+		if choice == 0 {
+			return "", nil
+		}
+		if choice > 0 && choice <= len(available) {
+			return available[choice-1], nil
+		}
+
+		fmt.Printf("Choose number in range 0..%d\n", len(available))
+		if errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("invalid player choice %q", line)
+		}
+	}
 }

@@ -22,6 +22,7 @@ go run . watch --id 17443
 - `--source-id` - ID источника
 - `--episode` - позиция эпизода
 - `--player` - плеер (`mpv|vlc|ffplay`) или путь к бинарнику
+- `--choose-player` - показать интерактивный выбор плеера перед запуском
 - `--player-arg` - доп. аргумент плеера (можно повторять)
 - `--print-url` - вывести только URL эпизода
 - `--no-progress` - не вызывать `history/add` и `episode/watch`
@@ -44,6 +45,12 @@ go run . watch --id 17443 --voiceover-id 10 --source-id 10 --episode 120
 
 ```bash
 go run . watch --id 17443 --player mpv --player-arg=--fullscreen --player-arg=--volume=50
+```
+
+Интерактивно выбрать плеер:
+
+```bash
+go run . watch --id 17443 --choose-player
 ```
 
 ## Ограничения

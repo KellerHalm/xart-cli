@@ -12,6 +12,8 @@ import (
 	"xart-cli/internal/xart"
 )
 
+var knownPlayers = []string{"mpv", "vlc", "ffplay"}
+
 type Voiceover struct {
 	ID   int
 	Name string
@@ -98,8 +100,7 @@ func BuildLaunchPlan(streamURL string, opts LaunchOptions) (LaunchPlan, error) {
 	playerName := ""
 
 	if executable == "" {
-		candidates := []string{"mpv", "vlc", "ffplay"}
-		for _, candidate := range candidates {
+		for _, candidate := range knownPlayers {
 			resolved, err := exec.LookPath(candidate)
 			if err != nil {
 				continue
@@ -147,6 +148,16 @@ func BuildLaunchPlan(streamURL string, opts LaunchOptions) (LaunchPlan, error) {
 		PlayerName: normalized,
 		URL:        streamURL,
 	}, nil
+}
+
+func DetectAvailablePlayers() []string {
+	available := make([]string, 0, len(knownPlayers))
+	for _, candidate := range knownPlayers {
+		if _, err := exec.LookPath(candidate); err == nil {
+			available = append(available, candidate)
+		}
+	}
+	return available
 }
 
 func (p LaunchPlan) Command() *exec.Cmd {

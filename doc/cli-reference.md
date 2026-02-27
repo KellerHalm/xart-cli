@@ -43,6 +43,7 @@ go run . ui
 
 # Просмотр
 go run . watch --id 17443
+go run . watch --id 17443 --choose-player
 ```
 
 ## Справка по флагам
