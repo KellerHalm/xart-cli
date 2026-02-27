@@ -1,4 +1,4 @@
-# xart-cli - Консольный клиент Anixart/Xart на Go.
+# Xart-CLI - консольный клиент Anixart/Xart на Go.
 
 CLI повторяет основные возможности сайта `xart-rose.vercel.app` через API `https://api-s.anixsekai.com`:
 

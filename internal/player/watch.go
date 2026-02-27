@@ -2,17 +2,49 @@ package player
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"xart-cli/internal/xart"
 )
 
-var knownPlayers = []string{"mpv", "vlc", "ffplay"}
+var (
+	knownPlayers      = []string{"mpv", "vlc", "ffplay"}
+	playerHTTPClient  = &http.Client{Timeout: 20 * time.Second}
+	kodikBase64Shift  = 18
+	kodikVarTemplates = map[string]*regexp.Regexp{
+		"type":     regexp.MustCompile(`var\s+type\s*=\s*"([^"]*)";`),
+		"videoId":  regexp.MustCompile(`var\s+videoId\s*=\s*"([^"]*)";`),
+		"domain":   regexp.MustCompile(`var\s+domain\s*=\s*"([^"]*)";`),
+		"d_sign":   regexp.MustCompile(`var\s+d_sign\s*=\s*"([^"]*)";`),
+		"pd":       regexp.MustCompile(`var\s+pd\s*=\s*"([^"]*)";`),
+		"pd_sign":  regexp.MustCompile(`var\s+pd_sign\s*=\s*"([^"]*)";`),
+		"ref":      regexp.MustCompile(`var\s+ref\s*=\s*"([^"]*)";`),
+		"ref_sign": regexp.MustCompile(`var\s+ref_sign\s*=\s*"([^"]*)";`),
+	}
+)
+
+type kodikSource struct {
+	Src string `json:"src"`
+}
+
+type kodikFtorResponse struct {
+	Link    string                   `json:"link"`
+	Default int                      `json:"default"`
+	Links   map[string][]kodikSource `json:"links"`
+}
 
 type Voiceover struct {
 	ID   int
@@ -80,6 +112,10 @@ func ResolveSelection(ctx context.Context, client *xart.Client, releaseID int, t
 	if err != nil {
 		return Selection{}, err
 	}
+	episode.URL, err = resolvePlayableURL(ctx, episode.URL)
+	if err != nil {
+		return Selection{}, err
+	}
 
 	return Selection{
 		ReleaseID: releaseID,
@@ -133,7 +169,7 @@ func BuildLaunchPlan(streamURL string, opts LaunchOptions) (LaunchPlan, error) {
 	args := make([]string, 0, 8+len(extraArgs))
 	switch normalized {
 	case "mpv":
-		args = append(args, "--force-window=yes", "--ytdl=yes")
+		args = append(args, "--force-window=yes")
 	case "vlc":
 		args = append(args, "--play-and-exit")
 	case "ffplay":
@@ -348,6 +384,227 @@ func pickEpisode(episodes []Episode, episodePosition int) (Episode, error) {
 		return Episode{}, fmt.Errorf("episode %d is not available", episodePosition)
 	}
 	return episodes[len(episodes)-1], nil
+}
+
+func resolvePlayableURL(ctx context.Context, streamURL string) (string, error) {
+	streamURL = strings.TrimSpace(streamURL)
+	if streamURL == "" {
+		return "", fmt.Errorf("empty stream url")
+	}
+
+	parsed, err := url.Parse(streamURL)
+	if err != nil {
+		return "", fmt.Errorf("parse stream url: %w", err)
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return streamURL, nil
+	}
+	if !strings.Contains(host, "kodik.") {
+		return streamURL, nil
+	}
+
+	path := strings.ToLower(parsed.Path)
+	if strings.Contains(path, ".m3u8") || strings.Contains(path, ".mp4") {
+		return normalizeStreamURL(streamURL), nil
+	}
+
+	resolved, err := resolveKodikStreamURL(ctx, parsed)
+	if err != nil {
+		return "", fmt.Errorf("resolve kodik stream: %w", err)
+	}
+	return normalizeStreamURL(resolved), nil
+}
+
+func resolveKodikStreamURL(ctx context.Context, parsed *url.URL) (string, error) {
+	pageReq, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("build kodik page request: %w", err)
+	}
+	pageResp, err := playerHTTPClient.Do(pageReq)
+	if err != nil {
+		return "", fmt.Errorf("request kodik page: %w", err)
+	}
+	defer pageResp.Body.Close()
+	if pageResp.StatusCode < 200 || pageResp.StatusCode >= 300 {
+		return "", fmt.Errorf("kodik page status %d", pageResp.StatusCode)
+	}
+
+	body, err := io.ReadAll(pageResp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read kodik page: %w", err)
+	}
+	html := string(body)
+
+	vars := map[string]string{}
+	for key, re := range kodikVarTemplates {
+		matches := re.FindStringSubmatch(html)
+		if len(matches) < 2 {
+			return "", fmt.Errorf("missing %s in kodik page", key)
+		}
+		vars[key] = matches[1]
+	}
+
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(segments) < 3 {
+		return "", fmt.Errorf("unexpected kodik path %q", parsed.Path)
+	}
+	hash := segments[2]
+	requestedQuality := 0
+	if len(segments) >= 4 {
+		requestedQuality = parseQuality(strings.TrimSpace(segments[3]))
+	}
+
+	form := url.Values{}
+	form.Set("d", vars["domain"])
+	form.Set("d_sign", vars["d_sign"])
+	form.Set("pd", vars["pd"])
+	form.Set("pd_sign", vars["pd_sign"])
+	form.Set("ref", vars["ref"])
+	form.Set("ref_sign", vars["ref_sign"])
+	form.Set("bad_user", "false")
+	form.Set("type", vars["type"])
+	form.Set("id", vars["videoId"])
+	form.Set("hash", hash)
+
+	ftorURL := fmt.Sprintf("%s://%s/ftor", parsed.Scheme, parsed.Host)
+	ftorReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ftorURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("build kodik ftor request: %w", err)
+	}
+	ftorReq.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+
+	ftorResp, err := playerHTTPClient.Do(ftorReq)
+	if err != nil {
+		return "", fmt.Errorf("request kodik ftor: %w", err)
+	}
+	defer ftorResp.Body.Close()
+	if ftorResp.StatusCode < 200 || ftorResp.StatusCode >= 300 {
+		return "", fmt.Errorf("kodik ftor status %d", ftorResp.StatusCode)
+	}
+
+	var payload kodikFtorResponse
+	if err := json.NewDecoder(ftorResp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode kodik ftor: %w", err)
+	}
+
+	if link := strings.TrimSpace(payload.Link); link != "" {
+		return link, nil
+	}
+
+	sourceURL, err := pickKodikSource(payload, requestedQuality)
+	if err != nil {
+		return "", err
+	}
+	return sourceURL, nil
+}
+
+func pickKodikSource(payload kodikFtorResponse, requestedQuality int) (string, error) {
+	if len(payload.Links) == 0 {
+		return "", fmt.Errorf("kodik response does not contain stream links")
+	}
+
+	qualityKeys := make([]int, 0, len(payload.Links))
+	for key := range payload.Links {
+		value, err := strconv.Atoi(key)
+		if err != nil {
+			continue
+		}
+		qualityKeys = append(qualityKeys, value)
+	}
+	sort.Ints(qualityKeys)
+
+	candidates := make([]int, 0, 4)
+	if requestedQuality > 0 {
+		candidates = append(candidates, requestedQuality)
+	}
+	if payload.Default > 0 {
+		candidates = append(candidates, payload.Default)
+	}
+	for i := len(qualityKeys) - 1; i >= 0; i-- {
+		candidates = append(candidates, qualityKeys[i])
+	}
+
+	seen := map[int]struct{}{}
+	for _, quality := range candidates {
+		if _, ok := seen[quality]; ok {
+			continue
+		}
+		seen[quality] = struct{}{}
+
+		sources := payload.Links[strconv.Itoa(quality)]
+		for _, source := range sources {
+			decoded, err := decodeKodikSource(source.Src)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(decoded) != "" {
+				return decoded, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no playable stream in kodik links")
+}
+
+func decodeKodikSource(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("empty source url")
+	}
+	if strings.Contains(raw, "://") || strings.HasPrefix(raw, "//") {
+		return raw, nil
+	}
+
+	rotated := make([]rune, 0, len(raw))
+	for _, ch := range raw {
+		switch {
+		case ch >= 'A' && ch <= 'Z':
+			next := ch + rune(kodikBase64Shift)
+			if next > 'Z' {
+				next -= 26
+			}
+			rotated = append(rotated, next)
+		case ch >= 'a' && ch <= 'z':
+			next := ch + rune(kodikBase64Shift)
+			if next > 'z' {
+				next -= 26
+			}
+			rotated = append(rotated, next)
+		default:
+			rotated = append(rotated, ch)
+		}
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(string(rotated))
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(string(rotated))
+		if err != nil {
+			return "", fmt.Errorf("decode base64 source: %w", err)
+		}
+	}
+	return string(decoded), nil
+}
+
+func parseQuality(value string) int {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, "p")
+	if value == "" {
+		return 0
+	}
+	quality, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return quality
+}
+
+func normalizeStreamURL(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "//") {
+		return "https:" + value
+	}
+	return value
 }
 
 func intFromAny(value any) int {
