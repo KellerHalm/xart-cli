@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"xart-cli/internal/gompbridge"
 	"xart-cli/internal/player"
 )
 
@@ -25,10 +27,11 @@ func newWatchCommand() *cobra.Command {
 	var chooseVoiceover bool
 	var printURL bool
 	var noProgress bool
+	var useGomp bool
 
 	cmd := &cobra.Command{
 		Use:   "watch",
-		Short: "Смотреть тайтл в локальном плеере прямо из терминала",
+		Short: "Watch a release in a local player or through gomp TUI",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if releaseID <= 0 {
 				return fmt.Errorf("flag --id is required")
@@ -38,6 +41,29 @@ func newWatchCommand() *cobra.Command {
 			}
 			if chooseVoiceover && voiceoverID > 0 {
 				return fmt.Errorf("flags --choose-voiceover and --voiceover-id are mutually exclusive")
+			}
+
+			if useGomp {
+				if choosePlayer {
+					return fmt.Errorf("flag --choose-player is not supported with --gomp; gomp uses mpv backend")
+				}
+				if printURL {
+					return fmt.Errorf("flag --print-url is not supported with --gomp")
+				}
+				if playerExecutable != "" && !looksLikeMPV(playerExecutable) {
+					return fmt.Errorf("flag --player with --gomp must point to mpv")
+				}
+
+				return gompbridge.RunWatchTUI(withContext(), rt.client, gompbridge.WatchOptions{
+					ReleaseID:       releaseID,
+					Token:           tokenOptional(),
+					VoiceoverID:     voiceoverID,
+					SourceID:        sourceID,
+					EpisodePosition: episodePosition,
+					MarkProgress:    !noProgress,
+					MPVExecutable:   playerExecutable,
+					MPVArgs:         playerArgs,
+				})
 			}
 
 			selectedVoiceoverID := voiceoverID
@@ -84,7 +110,6 @@ func newWatchCommand() *cobra.Command {
 					selection.Source.ID,
 					selection.Episode.Position,
 				); err != nil {
-					// Non-fatal: playback can still continue.
 					fmt.Fprintf(os.Stderr, "warning: failed to mark watch progress: %v\n", err)
 				}
 			}
@@ -98,7 +123,7 @@ func newWatchCommand() *cobra.Command {
 			}
 
 			fmt.Printf(
-				"Release %d | Озвучка: %s (%d) | Источник: %s (%d) | Эпизод: %s (%d)\n",
+				"Release %d | Voiceover: %s (%d) | Source: %s (%d) | Episode: %s (%d)\n",
 				selection.ReleaseID,
 				selection.Voiceover.Name,
 				selection.Voiceover.ID,
@@ -117,17 +142,27 @@ func newWatchCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().IntVar(&releaseID, "id", 0, "ID релиза")
-	cmd.Flags().IntVar(&voiceoverID, "voiceover-id", 0, "ID озвучки (по умолчанию первая доступная)")
-	cmd.Flags().IntVar(&sourceID, "source-id", 0, "ID источника/плеера (по умолчанию первый доступный)")
-	cmd.Flags().IntVar(&episodePosition, "episode", -1, "Позиция эпизода (по умолчанию последний доступный)")
-	cmd.Flags().StringVar(&playerExecutable, "player", "", "Плеер: mpv|vlc|ffplay или путь к исполняемому файлу")
-	cmd.Flags().BoolVar(&choosePlayer, "choose-player", false, "Выбрать плеер интерактивно перед запуском")
-	cmd.Flags().BoolVar(&chooseVoiceover, "choose-voiceover", false, "Выбрать озвучку интерактивно перед запуском")
-	cmd.Flags().StringArrayVar(&playerArgs, "player-arg", nil, "Дополнительный аргумент плеера (можно повторять)")
-	cmd.Flags().BoolVar(&printURL, "print-url", false, "Только вывести URL выбранного эпизода")
-	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Не отмечать эпизод в истории/просмотренном")
+	cmd.Flags().IntVar(&releaseID, "id", 0, "Release ID")
+	cmd.Flags().IntVar(&voiceoverID, "voiceover-id", 0, "Voiceover ID")
+	cmd.Flags().IntVar(&sourceID, "source-id", 0, "Source/player ID")
+	cmd.Flags().IntVar(&episodePosition, "episode", -1, "Episode position; default is the last available episode")
+	cmd.Flags().StringVar(&playerExecutable, "player", "", "Player executable for classic watch mode, or mpv path for --gomp")
+	cmd.Flags().BoolVar(&choosePlayer, "choose-player", false, "Choose player interactively before launch")
+	cmd.Flags().BoolVar(&chooseVoiceover, "choose-voiceover", false, "Choose voiceover interactively before launch")
+	cmd.Flags().StringArrayVar(&playerArgs, "player-arg", nil, "Additional player argument; repeat flag for multiple values")
+	cmd.Flags().BoolVar(&printURL, "print-url", false, "Print the resolved episode URL without launching playback")
+	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Do not mark watch progress in profile history")
+	cmd.Flags().BoolVar(&useGomp, "gomp", false, "Launch the gomp TUI player with voiceover/source/episode selection")
 	return cmd
+}
+
+func looksLikeMPV(executable string) bool {
+	executable = strings.TrimSpace(executable)
+	if executable == "" {
+		return true
+	}
+	base := strings.ToLower(strings.TrimSuffix(filepath.Base(executable), filepath.Ext(executable)))
+	return base == "mpv"
 }
 
 func choosePlayerInteractively() (string, error) {

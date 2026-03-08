@@ -90,6 +90,33 @@ func ListVoiceovers(ctx context.Context, client *xart.Client, releaseID int) ([]
 	return fetchVoiceovers(ctx, client, releaseID)
 }
 
+func ListSources(ctx context.Context, client *xart.Client, releaseID, voiceoverID int) ([]Source, error) {
+	if releaseID <= 0 {
+		return nil, fmt.Errorf("release id must be > 0")
+	}
+	if voiceoverID <= 0 {
+		return nil, fmt.Errorf("voiceover id must be > 0")
+	}
+	return fetchSources(ctx, client, releaseID, voiceoverID)
+}
+
+func ListEpisodes(ctx context.Context, client *xart.Client, releaseID, voiceoverID, sourceID int, token string) ([]Episode, error) {
+	if releaseID <= 0 {
+		return nil, fmt.Errorf("release id must be > 0")
+	}
+	if voiceoverID <= 0 {
+		return nil, fmt.Errorf("voiceover id must be > 0")
+	}
+	if sourceID <= 0 {
+		return nil, fmt.Errorf("source id must be > 0")
+	}
+	return fetchEpisodes(ctx, client, releaseID, voiceoverID, sourceID, token)
+}
+
+func ResolvePlayableURL(ctx context.Context, rawURL string) (string, error) {
+	return resolvePlayableURL(ctx, rawURL)
+}
+
 func ResolveSelection(ctx context.Context, client *xart.Client, releaseID int, token string, voiceoverID, sourceID, episodePosition int) (Selection, error) {
 	if releaseID <= 0 {
 		return Selection{}, fmt.Errorf("release id must be > 0")

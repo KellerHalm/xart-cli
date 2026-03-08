@@ -58,3 +58,18 @@ go run . watch --id 17443 --choose-player
 - Команда зависит от того, какие данные вернет API для релиза.
 - Для части источников может вернуться iframe-URL; надежнее всего работает `mpv`.
 - Если плеер не найден, команда завершится ошибкой и подскажет доступные варианты.
+
+## gomp TUI
+
+`watch` can also launch the new `gomp` TUI player:
+
+```bash
+go run . watch --id 17443 --gomp
+```
+
+In this mode:
+
+- voiceover, source, and episode are chosen inside the TUI;
+- playback uses the `mpv` backend from `gomp`;
+- `--player` may be used only to point to an `mpv` executable;
+- `--choose-player` and `--print-url` are not supported together with `--gomp`.
