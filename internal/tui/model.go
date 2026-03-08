@@ -145,6 +145,7 @@ type Model struct {
 	watchReleaseID          int
 	voiceoverPickerOpen     bool
 	voiceoverPickerItems    []player.Voiceover
+	voiceoverPickerOffset   int
 	voiceoverPickerSelected int
 }
 
@@ -331,6 +332,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.errText = ""
 		m.voiceoverPickerOpen = true
 		m.voiceoverPickerItems = msg.Voiceovers
+		m.voiceoverPickerOffset = 0
 		m.voiceoverPickerSelected = 0
 		m.statusText = fmt.Sprintf("Выберите озвучку: %d вариантов", len(msg.Voiceovers))
 		return m, nil
@@ -613,13 +615,13 @@ func (m *Model) View() string {
 	}
 
 	header := m.renderHeader()
-	voiceoverPicker := m.renderVoiceoverPicker()
 	authForm := m.renderAuthForm()
 	footer := m.renderFooter()
 	headerLines := countLines(header)
-	voiceoverLines := countLines(voiceoverPicker)
 	authLines := countLines(authForm)
 	footerLines := countLines(footer)
+	voiceoverPicker := m.renderVoiceoverPicker(max(0, m.height-headerLines-authLines-footerLines-3))
+	voiceoverLines := countLines(voiceoverPicker)
 	bodyLines := m.bodyLines(headerLines, voiceoverLines+authLines, footerLines)
 	if m.mode == modeDetail {
 		body := m.renderDetail(bodyLines)
@@ -831,7 +833,7 @@ func (m *Model) renderDetail(bodyLines int) string {
 		Render(box.Render(strings.Join(visible, "\n")))
 }
 
-func (m *Model) renderVoiceoverPicker() string {
+func (m *Model) renderVoiceoverPicker(maxLines int) string {
 	if !m.voiceoverPickerOpen || len(m.voiceoverPickerItems) == 0 {
 		return ""
 	}
@@ -846,13 +848,33 @@ func (m *Model) renderVoiceoverPicker() string {
 	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 	normalStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 
-	lines := []string{
-		titleStyle.Render("Выбор озвучки перед запуском"),
-		normalStyle.Render("↑/↓ или j/k — выбрать, Enter — запустить, Esc — отмена"),
-		"",
+	contentLines := max(1, maxLines-2)
+	title := titleStyle.Render(trimRunes("Выбор озвучки перед запуском", innerWidth))
+	help := normalStyle.Render(trimRunes("↑/↓ или j/k, PgUp/PgDn, Home/End, Enter, Esc", innerWidth))
+
+	lines := make([]string, 0, contentLines)
+	switch {
+	case contentLines >= 4:
+		lines = append(lines, title, help)
+	case contentLines >= 2:
+		lines = append(lines, title)
 	}
 
-	for i, voiceover := range m.voiceoverPickerItems {
+	visibleItems := max(1, contentLines-3)
+	m.ensureVoiceoverPickerVisible(visibleItems)
+
+	start := m.voiceoverPickerOffset
+	end := min(len(m.voiceoverPickerItems), start+visibleItems)
+	status := fmt.Sprintf("Показано %d-%d из %d", start+1, end, len(m.voiceoverPickerItems))
+	if start == 0 && end == len(m.voiceoverPickerItems) {
+		status = fmt.Sprintf("Всего вариантов: %d", len(m.voiceoverPickerItems))
+	}
+	if contentLines >= 3 {
+		lines = append(lines, normalStyle.Render(trimRunes(status, innerWidth)))
+	}
+
+	for i := start; i < end; i++ {
+		voiceover := m.voiceoverPickerItems[i]
 		prefix := fmt.Sprintf(" %d. ", i+1)
 		item := fmt.Sprintf("%s%s (id=%d)", prefix, emptyFallback(voiceover.Name, "без названия"), voiceover.ID)
 		if i == m.voiceoverPickerSelected {
@@ -1065,6 +1087,7 @@ func (m *Model) beginVoiceoverSelectionCmd() tea.Cmd {
 	m.watchReleaseID = releaseID
 	m.voiceoverPickerOpen = false
 	m.voiceoverPickerItems = nil
+	m.voiceoverPickerOffset = 0
 	m.voiceoverPickerSelected = 0
 	m.errText = ""
 	m.statusText = "Загрузка списка озвучек..."
@@ -1125,6 +1148,7 @@ func (m *Model) handleVoiceoverPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc", "backspace", "q":
 		m.voiceoverPickerOpen = false
 		m.voiceoverPickerItems = nil
+		m.voiceoverPickerOffset = 0
 		m.voiceoverPickerSelected = 0
 		m.watchReleaseID = 0
 		m.statusText = "Выбор озвучки отменен"
@@ -1133,16 +1157,35 @@ func (m *Model) handleVoiceoverPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.voiceoverPickerSelected > 0 {
 			m.voiceoverPickerSelected--
 		}
+		m.ensureVoiceoverPickerVisible(m.voiceoverPickerVisibleItems())
 		return m, nil
 	case "down", "j":
 		if m.voiceoverPickerSelected < len(m.voiceoverPickerItems)-1 {
 			m.voiceoverPickerSelected++
 		}
+		m.ensureVoiceoverPickerVisible(m.voiceoverPickerVisibleItems())
+		return m, nil
+	case "home":
+		m.voiceoverPickerSelected = 0
+		m.ensureVoiceoverPickerVisible(m.voiceoverPickerVisibleItems())
+		return m, nil
+	case "end":
+		m.voiceoverPickerSelected = len(m.voiceoverPickerItems) - 1
+		m.ensureVoiceoverPickerVisible(m.voiceoverPickerVisibleItems())
+		return m, nil
+	case "pgup":
+		m.voiceoverPickerSelected = max(0, m.voiceoverPickerSelected-m.voiceoverPickerVisibleItems())
+		m.ensureVoiceoverPickerVisible(m.voiceoverPickerVisibleItems())
+		return m, nil
+	case "pgdown":
+		m.voiceoverPickerSelected = min(len(m.voiceoverPickerItems)-1, m.voiceoverPickerSelected+m.voiceoverPickerVisibleItems())
+		m.ensureVoiceoverPickerVisible(m.voiceoverPickerVisibleItems())
 		return m, nil
 	case "enter":
 		voiceover := m.voiceoverPickerItems[m.voiceoverPickerSelected]
 		m.voiceoverPickerOpen = false
 		m.voiceoverPickerItems = nil
+		m.voiceoverPickerOffset = 0
 		m.voiceoverPickerSelected = 0
 		return m, m.watchByReleaseCmd(m.watchReleaseID, voiceover.ID)
 	}
@@ -1154,6 +1197,7 @@ func (m *Model) handleVoiceoverPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			voiceover := m.voiceoverPickerItems[m.voiceoverPickerSelected]
 			m.voiceoverPickerOpen = false
 			m.voiceoverPickerItems = nil
+			m.voiceoverPickerOffset = 0
 			m.voiceoverPickerSelected = 0
 			return m, m.watchByReleaseCmd(m.watchReleaseID, voiceover.ID)
 		}
@@ -1252,6 +1296,7 @@ func (m *Model) switchSection(section sectionMode) tea.Cmd {
 	m.watchReleaseID = 0
 	m.voiceoverPickerOpen = false
 	m.voiceoverPickerItems = nil
+	m.voiceoverPickerOffset = 0
 	m.voiceoverPickerSelected = 0
 	m.beginCardsReload(true)
 	if section == sectionBookmarks && m.userID == 0 {
@@ -1424,6 +1469,39 @@ func (m *Model) visibleRows(bodyLines int) int {
 		return 1
 	}
 	return max(1, bodyLines/rowHeight)
+}
+
+func (m *Model) voiceoverPickerVisibleItems() int {
+	headerLines := countLines(m.renderHeader())
+	authLines := countLines(m.renderAuthForm())
+	footerLines := countLines(m.renderFooter())
+	maxLines := max(1, m.height-headerLines-authLines-footerLines-3)
+	contentLines := max(1, maxLines-2)
+	return max(1, contentLines-3)
+}
+
+func (m *Model) ensureVoiceoverPickerVisible(visibleItems int) {
+	if len(m.voiceoverPickerItems) == 0 {
+		m.voiceoverPickerOffset = 0
+		return
+	}
+	if visibleItems <= 0 {
+		visibleItems = 1
+	}
+	if m.voiceoverPickerSelected < m.voiceoverPickerOffset {
+		m.voiceoverPickerOffset = m.voiceoverPickerSelected
+	}
+	if m.voiceoverPickerSelected >= m.voiceoverPickerOffset+visibleItems {
+		m.voiceoverPickerOffset = m.voiceoverPickerSelected - visibleItems + 1
+	}
+
+	maxOffset := max(0, len(m.voiceoverPickerItems)-visibleItems)
+	if m.voiceoverPickerOffset > maxOffset {
+		m.voiceoverPickerOffset = maxOffset
+	}
+	if m.voiceoverPickerOffset < 0 {
+		m.voiceoverPickerOffset = 0
+	}
 }
 
 func addWrappedLine(lines *[]string, value string, width int) {

@@ -3,7 +3,7 @@ module xart-cli
 go 1.25.1
 
 require (
-	github.com/KellerHalm/gomp v0.0.0
+	github.com/KellerHalm/gomp v0.0.0-20260308091746-cbe7b87f0aa1
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/spf13/cobra v1.9.1
@@ -31,5 +31,3 @@ require (
 	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 )
-
-replace github.com/KellerHalm/gomp => ../..
