@@ -1,4 +1,4 @@
-package gompbridge
+﻿package gompbridge
 
 import (
 	"context"

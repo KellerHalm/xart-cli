@@ -1,4 +1,4 @@
-package xart
+﻿package xart
 
 import (
 	"bytes"
