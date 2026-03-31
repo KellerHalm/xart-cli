@@ -1,14 +1,17 @@
-﻿package gompbridge
+package gompbridge
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/KellerHalm/gomp"
-	"github.com/KellerHalm/gomp/backend/mpv"
+	playermpv "github.com/KellerHalm/gomp/player/mpv"
 	"github.com/KellerHalm/gomp/tui"
 
 	"xart-cli/internal/player"
@@ -26,12 +29,6 @@ type WatchOptions struct {
 	MPVArgs         []string
 }
 
-type WatchResolver struct {
-	client       *xart.Client
-	opts         WatchOptions
-	releaseTitle string
-}
-
 func RunWatchTUI(ctx context.Context, client *xart.Client, opts WatchOptions) error {
 	if client == nil {
 		return fmt.Errorf("xart client is required")
@@ -40,81 +37,53 @@ func RunWatchTUI(ctx context.Context, client *xart.Client, opts WatchOptions) er
 		return fmt.Errorf("release id must be > 0")
 	}
 
-	resolver := &WatchResolver{
-		client: client,
-		opts:   opts,
+	releaseTitle := releaseName(ctx, client, opts.ReleaseID, opts.Token)
+
+	voiceovers, err := player.ListVoiceovers(ctx, client, opts.ReleaseID)
+	if err != nil {
+		return err
+	}
+	voiceover, err := pickVoiceover(opts.VoiceoverID, releaseTitle, voiceovers)
+	if err != nil {
+		return err
 	}
 
-	return tui.Run(ctx, tui.Config{
-		Resolver: resolver,
-		Backend: mpv.New(mpv.Config{
-			Executable: opts.MPVExecutable,
-			ExtraArgs:  opts.MPVArgs,
-		}),
-		AutoStart: true,
-	})
-}
-
-func (r *WatchResolver) NextStep(ctx context.Context, values gomp.SelectionValues) (gomp.SelectionStep, error) {
-	voiceoverID, ok, err := r.voiceoverID(values)
+	sources, err := player.ListSources(ctx, client, opts.ReleaseID, voiceover.ID)
 	if err != nil {
-		return gomp.SelectionStep{}, err
+		return err
 	}
-	if !ok {
-		return r.voiceoverStep(ctx)
+	source, err := pickSource(opts.SourceID, releaseTitle, voiceover, sources)
+	if err != nil {
+		return err
 	}
 
-	sourceID, ok, err := r.sourceID(values)
+	episodes, err := player.ListEpisodes(ctx, client, opts.ReleaseID, voiceover.ID, source.ID, opts.Token)
 	if err != nil {
-		return gomp.SelectionStep{}, err
+		return err
 	}
-	if !ok {
-		return r.sourceStep(ctx, voiceoverID)
-	}
-
-	_, ok, err = r.episodePosition(values)
+	episode, err := pickEpisode(opts.EpisodePosition, releaseTitle, voiceover, source, episodes)
 	if err != nil {
-		return gomp.SelectionStep{}, err
-	}
-	if !ok {
-		return r.episodeStep(ctx, voiceoverID, sourceID)
-	}
-
-	return gomp.SelectionStep{}, gomp.ErrSelectionComplete
-}
-
-func (r *WatchResolver) Resolve(ctx context.Context, values gomp.SelectionValues) (gomp.Playlist, error) {
-	voiceoverID, _, err := r.voiceoverID(values)
-	if err != nil {
-		return gomp.Playlist{}, err
-	}
-	sourceID, _, err := r.sourceID(values)
-	if err != nil {
-		return gomp.Playlist{}, err
-	}
-	episodePosition, _, err := r.episodePosition(values)
-	if err != nil {
-		return gomp.Playlist{}, err
+		return err
 	}
 
 	selection, err := player.ResolveSelection(
 		ctx,
-		r.client,
-		r.opts.ReleaseID,
-		r.opts.Token,
-		voiceoverID,
-		sourceID,
-		episodePosition,
+		client,
+		opts.ReleaseID,
+		opts.Token,
+		voiceover.ID,
+		source.ID,
+		episode.Position,
 	)
 	if err != nil {
-		return gomp.Playlist{}, err
+		return err
 	}
 
-	if r.opts.MarkProgress {
+	if opts.MarkProgress {
 		if err := player.MarkEpisodeProgress(
 			ctx,
-			r.client,
-			r.opts.Token,
+			client,
+			opts.Token,
 			selection.ReleaseID,
 			selection.Source.ID,
 			selection.Episode.Position,
@@ -123,16 +92,36 @@ func (r *WatchResolver) Resolve(ctx context.Context, values gomp.SelectionValues
 		}
 	}
 
-	releaseTitle := r.releaseName(ctx)
-	episodes, err := player.ListEpisodes(ctx, r.client, r.opts.ReleaseID, voiceoverID, sourceID, r.opts.Token)
+	playlist, err := buildPlaylist(ctx, releaseTitle, selection, episodes)
 	if err != nil {
-		return gomp.Playlist{}, err
+		return err
 	}
 
+	controller, err := playermpv.New(ctx, playermpv.Config{
+		Binary:    strings.TrimSpace(opts.MPVExecutable),
+		ExtraArgs: opts.MPVArgs,
+	})
+	if err != nil {
+		return err
+	}
+	defer controller.Close()
+
+	return tui.Run(ctx, tui.Options{
+		Player:          controller,
+		Playlist:        playlist,
+		AlternateScreen: true,
+	})
+}
+
+func buildPlaylist(ctx context.Context, releaseTitle string, selection player.Selection, episodes []player.Episode) (gomp.Playlist, error) {
 	tracks := make([]gomp.Track, 0, len(episodes))
 	startIndex := 0
+
+	fmt.Fprintf(os.Stderr, "Resolving playlist for %s: %d episodes\n", releaseTitle, len(episodes))
+
 	for _, episode := range episodes {
 		playableURL := ""
+		var err error
 		switch episode.Position {
 		case selection.Episode.Position:
 			playableURL = selection.Episode.URL
@@ -170,125 +159,163 @@ func (r *WatchResolver) Resolve(ctx context.Context, values gomp.SelectionValues
 	}
 
 	if len(tracks) == 0 {
-		return gomp.Playlist{}, fmt.Errorf("no playable episodes were resolved for release %d", r.opts.ReleaseID)
+		return gomp.Playlist{}, fmt.Errorf("no playable episodes were resolved for release %d", selection.ReleaseID)
 	}
 
 	return gomp.Playlist{
 		Title:       releaseTitle,
-		Description: fmt.Sprintf("xart-cli watch via gomp TUI (release %d)", r.opts.ReleaseID),
+		Description: fmt.Sprintf("xart-cli watch via gomp TUI (release %d)", selection.ReleaseID),
 		StartIndex:  startIndex,
 		Tracks:      tracks,
 	}, nil
 }
 
-func (r *WatchResolver) voiceoverStep(ctx context.Context) (gomp.SelectionStep, error) {
-	voiceovers, err := player.ListVoiceovers(ctx, r.client, r.opts.ReleaseID)
-	if err != nil {
-		return gomp.SelectionStep{}, err
+func pickVoiceover(selectedID int, releaseTitle string, voiceovers []player.Voiceover) (player.Voiceover, error) {
+	if len(voiceovers) == 0 {
+		return player.Voiceover{}, fmt.Errorf("voiceovers not found")
 	}
-	options := make([]gomp.SelectionOption, 0, len(voiceovers))
+	if selectedID > 0 {
+		for _, voiceover := range voiceovers {
+			if voiceover.ID == selectedID {
+				return voiceover, nil
+			}
+		}
+		return player.Voiceover{}, fmt.Errorf("voiceover id %d is not available", selectedID)
+	}
+
+	options := make([]string, 0, len(voiceovers))
 	for _, voiceover := range voiceovers {
-		options = append(options, gomp.SelectionOption{
-			ID:    strconv.Itoa(voiceover.ID),
-			Title: fallbackText(voiceover.Name, fmt.Sprintf("Voiceover %d", voiceover.ID)),
-		})
+		options = append(options, fmt.Sprintf("%s (id=%d)", fallbackText(voiceover.Name, "untitled"), voiceover.ID))
 	}
-	return gomp.SelectionStep{
-		Key:         "voiceover",
-		Title:       "Voiceover",
-		Description: "Choose the dub/voiceover before source and episode selection.",
-		Options:     options,
-	}, nil
+	index, err := promptChoice(
+		fmt.Sprintf("Choose voiceover for %s", releaseTitle),
+		options,
+		0,
+	)
+	if err != nil {
+		return player.Voiceover{}, err
+	}
+	return voiceovers[index], nil
 }
 
-func (r *WatchResolver) sourceStep(ctx context.Context, voiceoverID int) (gomp.SelectionStep, error) {
-	sources, err := player.ListSources(ctx, r.client, r.opts.ReleaseID, voiceoverID)
-	if err != nil {
-		return gomp.SelectionStep{}, err
+func pickSource(selectedID int, releaseTitle string, voiceover player.Voiceover, sources []player.Source) (player.Source, error) {
+	if len(sources) == 0 {
+		return player.Source{}, fmt.Errorf("sources not found")
 	}
-	options := make([]gomp.SelectionOption, 0, len(sources))
+	if selectedID > 0 {
+		for _, source := range sources {
+			if source.ID == selectedID {
+				return source, nil
+			}
+		}
+		return player.Source{}, fmt.Errorf("source id %d is not available", selectedID)
+	}
+
+	options := make([]string, 0, len(sources))
 	for _, source := range sources {
-		options = append(options, gomp.SelectionOption{
-			ID:    strconv.Itoa(source.ID),
-			Title: fallbackText(source.Name, fmt.Sprintf("Source %d", source.ID)),
-		})
+		options = append(options, fmt.Sprintf("%s (id=%d)", fallbackText(source.Name, "untitled"), source.ID))
 	}
-	return gomp.SelectionStep{
-		Key:         "source",
-		Title:       "Source",
-		Description: "Choose the player source for the selected voiceover.",
-		Options:     options,
-	}, nil
+	index, err := promptChoice(
+		fmt.Sprintf("Choose source for %s / %s", releaseTitle, fallbackText(voiceover.Name, "voiceover")),
+		options,
+		0,
+	)
+	if err != nil {
+		return player.Source{}, err
+	}
+	return sources[index], nil
 }
 
-func (r *WatchResolver) episodeStep(ctx context.Context, voiceoverID, sourceID int) (gomp.SelectionStep, error) {
-	episodes, err := player.ListEpisodes(ctx, r.client, r.opts.ReleaseID, voiceoverID, sourceID, r.opts.Token)
-	if err != nil {
-		return gomp.SelectionStep{}, err
+func pickEpisode(selectedPosition int, releaseTitle string, voiceover player.Voiceover, source player.Source, episodes []player.Episode) (player.Episode, error) {
+	if len(episodes) == 0 {
+		return player.Episode{}, fmt.Errorf("episodes not found")
 	}
-	options := make([]gomp.SelectionOption, 0, len(episodes))
-	initialIndex := 0
-	for i, episode := range episodes {
+	if selectedPosition > 0 {
+		for _, episode := range episodes {
+			if episode.Position == selectedPosition {
+				return episode, nil
+			}
+		}
+		return player.Episode{}, fmt.Errorf("episode %d is not available", selectedPosition)
+	}
+
+	options := make([]string, 0, len(episodes))
+	for _, episode := range episodes {
 		title := strings.TrimSpace(episode.Name)
 		if title == "" {
 			title = fmt.Sprintf("Episode %d", episode.Position)
 		}
-		options = append(options, gomp.SelectionOption{
-			ID:       strconv.Itoa(episode.Position),
-			Title:    title,
-			Subtitle: fmt.Sprintf("position %d", episode.Position),
-		})
-		initialIndex = i
+		options = append(options, fmt.Sprintf("%s (episode %d)", title, episode.Position))
 	}
-	return gomp.SelectionStep{
-		Key:          "episode",
-		Title:        "Episode",
-		Description:  "Choose which episode to resolve and start in the gomp TUI player.",
-		InitialIndex: initialIndex,
-		Options:      options,
-	}, nil
+	index, err := promptChoice(
+		fmt.Sprintf("Choose episode for %s / %s / %s", releaseTitle, fallbackText(voiceover.Name, "voiceover"), fallbackText(source.Name, "source")),
+		options,
+		len(episodes)-1,
+	)
+	if err != nil {
+		return player.Episode{}, err
+	}
+	return episodes[index], nil
 }
 
-func (r *WatchResolver) voiceoverID(values gomp.SelectionValues) (int, bool, error) {
-	if r.opts.VoiceoverID > 0 {
-		return r.opts.VoiceoverID, true, nil
+func promptChoice(label string, options []string, defaultIndex int) (int, error) {
+	if len(options) == 0 {
+		return 0, fmt.Errorf("choice list is empty")
 	}
-	return parseOptionalSelection(values["voiceover"], "voiceover")
+	if defaultIndex < 0 || defaultIndex >= len(options) {
+		defaultIndex = 0
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("%s:\n", label)
+	for index, option := range options {
+		fmt.Printf("  %d) %s\n", index+1, option)
+	}
+
+	for {
+		fmt.Printf("Enter number [default %d]: ", defaultIndex+1)
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, fmt.Errorf("read choice: %w", err)
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return defaultIndex, nil
+		}
+
+		choice, convErr := strconv.Atoi(line)
+		if convErr != nil {
+			fmt.Printf("Invalid choice %q\n", line)
+			if errors.Is(err, io.EOF) {
+				return 0, fmt.Errorf("invalid choice %q", line)
+			}
+			continue
+		}
+		if choice >= 1 && choice <= len(options) {
+			return choice - 1, nil
+		}
+
+		fmt.Printf("Choose number in range 1..%d\n", len(options))
+		if errors.Is(err, io.EOF) {
+			return 0, fmt.Errorf("invalid choice %q", line)
+		}
+	}
 }
 
-func (r *WatchResolver) sourceID(values gomp.SelectionValues) (int, bool, error) {
-	if r.opts.SourceID > 0 {
-		return r.opts.SourceID, true, nil
-	}
-	return parseOptionalSelection(values["source"], "source")
-}
-
-func (r *WatchResolver) episodePosition(values gomp.SelectionValues) (int, bool, error) {
-	if r.opts.EpisodePosition > 0 {
-		return r.opts.EpisodePosition, true, nil
-	}
-	return parseOptionalSelection(values["episode"], "episode")
-}
-
-func (r *WatchResolver) releaseName(ctx context.Context) string {
-	if strings.TrimSpace(r.releaseTitle) != "" {
-		return r.releaseTitle
-	}
-
-	payload, err := r.client.Do(ctx, xart.Request{
+func releaseName(ctx context.Context, client *xart.Client, releaseID int, token string) string {
+	payload, err := client.Do(ctx, xart.Request{
 		Method: "GET",
-		Path:   fmt.Sprintf("/release/%d", r.opts.ReleaseID),
-		Token:  r.opts.Token,
+		Path:   fmt.Sprintf("/release/%d", releaseID),
+		Token:  token,
 	})
 	if err != nil {
-		r.releaseTitle = fmt.Sprintf("Release %d", r.opts.ReleaseID)
-		return r.releaseTitle
+		return fmt.Sprintf("Release %d", releaseID)
 	}
 
 	root, ok := payload.(map[string]any)
 	if !ok {
-		r.releaseTitle = fmt.Sprintf("Release %d", r.opts.ReleaseID)
-		return r.releaseTitle
+		return fmt.Sprintf("Release %d", releaseID)
 	}
 
 	release, _ := root["release"].(map[string]any)
@@ -296,27 +323,11 @@ func (r *WatchResolver) releaseName(ctx context.Context) string {
 		release = root
 	}
 
-	r.releaseTitle = firstNonEmpty(
+	return firstNonEmpty(
 		stringFromAny(release["title_ru"]),
 		stringFromAny(release["title_original"]),
-		fmt.Sprintf("Release %d", r.opts.ReleaseID),
+		fmt.Sprintf("Release %d", releaseID),
 	)
-	return r.releaseTitle
-}
-
-func parseOptionalSelection(raw string, label string) (int, bool, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 0, false, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, false, fmt.Errorf("invalid %s value %q: %w", label, raw, err)
-	}
-	if value <= 0 {
-		return 0, false, fmt.Errorf("%s must be > 0", label)
-	}
-	return value, true, nil
 }
 
 func stringFromAny(value any) string {
